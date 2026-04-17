@@ -400,7 +400,12 @@ func (s *LocalCRSService) buildFuzzersDocker(myFuzzer *string, taskDir, projectD
 	// Create a sanitizer-specific copy of the project directory
 	sanitizerProjectDir := fmt.Sprintf("%s-%s", projectDir, sanitizer)
 
-	// Create the directory if it doesn't exist
+	// Remove any stale copy from a previous run. Docker may leave root-owned
+	// files behind in the bind-mounted directory, so attempt ownership repair
+	// before giving up on cleanup.
+	if err := removeSanitizerProjectDir(sanitizerProjectDir); err != nil {
+		return fmt.Errorf("failed to remove stale sanitizer-specific project directory: %v", err)
+	}
 	if err := os.MkdirAll(sanitizerProjectDir, 0755); err != nil {
 		return fmt.Errorf("failed to create sanitizer-specific project directory: %v", err)
 	}
@@ -514,6 +519,29 @@ func (s *LocalCRSService) buildFuzzersDocker(myFuzzer *string, taskDir, projectD
 					sanitizer, err, buildOutput.String())
 			}
 		}
+	}
+	return nil
+}
+
+func removeSanitizerProjectDir(dir string) error {
+	if err := os.RemoveAll(dir); err == nil {
+		return nil
+	}
+
+	uidGid := fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid())
+	chownCmd := exec.Command("chown", "-R", uidGid, dir)
+	if output, chownErr := chownCmd.CombinedOutput(); chownErr != nil {
+		// Try non-interactive sudo for environments where the current user has
+		// sudo privileges but does not own root-created files from Docker runs.
+		sudoCmd := exec.Command("sudo", "-n", "chown", "-R", uidGid, dir)
+		if sudoOutput, sudoErr := sudoCmd.CombinedOutput(); sudoErr != nil {
+			return fmt.Errorf("cleanup failed; chown failed (%v: %s), sudo chown failed (%v: %s)",
+				chownErr, strings.TrimSpace(string(output)), sudoErr, strings.TrimSpace(string(sudoOutput)))
+		}
+	}
+
+	if err := os.RemoveAll(dir); err != nil {
+		return err
 	}
 	return nil
 }

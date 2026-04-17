@@ -466,12 +466,12 @@ if is_project_name "$TARGET"; then
     # Check environment before running
     check_environment
 
-    # Run CRS - use sudo -E to preserve environment (especially TAMU AI settings)
+    # Run CRS (preserve TAMU AI settings from check_environment / CLI)
     if [ "$USE_TAMU_AI" = true ]; then
         export USE_TAMU_AI=true
         print_info "TAMU AI mode enabled - all LLM calls will use TAMU AI API"
     fi
-    cd "$CRS_DIR" && sudo -E ./run_crs.sh --in-place "$WORKSPACE"
+    cd "$CRS_DIR" && bash ./run_crs.sh --in-place "$WORKSPACE"
 
 # ============================================
 # CASE 2: Git URL - Create workspace from scratch
@@ -589,12 +589,11 @@ elif is_git_url "$TARGET"; then
     # Check environment before running
     check_environment
 
-    # Run CRS - use sudo -E to preserve environment (especially TAMU AI settings)
     if [ "$USE_TAMU_AI" = true ]; then
         export USE_TAMU_AI=true
         print_info "TAMU AI mode enabled - all LLM calls will use TAMU AI API"
     fi
-    cd "$CRS_DIR" && sudo -E ./run_crs.sh --in-place "$WORKSPACE"
+    cd "$CRS_DIR" && bash ./run_crs.sh --in-place "$WORKSPACE"
 
 # ============================================
 # CASE 3: Local path - Use existing workspace
@@ -608,14 +607,13 @@ else
     # Check environment before running
     check_environment
 
-    # Run CRS - use sudo -E to preserve environment (especially TAMU AI settings)
     if [ "$USE_TAMU_AI" = true ]; then
         export USE_TAMU_AI=true
         print_info "TAMU AI mode enabled - all LLM calls will use TAMU AI API"
     fi
     if [ "$IN_PLACE" = true ]; then
-        cd "$CRS_DIR" && sudo -E ./run_crs.sh --in-place "$TARGET"
+        cd "$CRS_DIR" && bash ./run_crs.sh --in-place "$TARGET" || true
     else
-        cd "$CRS_DIR" && sudo -E ./run_crs.sh "$TARGET"
+        cd "$CRS_DIR" && bash ./run_crs.sh "$TARGET" || true
     fi
 fi
