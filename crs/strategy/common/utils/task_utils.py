@@ -17,6 +17,40 @@ if TYPE_CHECKING:
 # Constants
 DETECT_TIMEOUT_CRASH_SENTINEL = "detect_timeout_crash"
 
+SANITIZER_HOOKS_SO = "libsanitizer_shared_hooks.so"
+# Mount point inside the container for the directory containing SANITIZER_HOOKS_SO
+SANITIZER_HOOKS_MOUNT = "/sanitizer_hooks"
+
+
+def docker_args_for_sanitizer_hooks(project_dir: str, prefer_path_fragment: str = "") -> List[str]:
+    """
+    LLVM may link ASan fuzzers against libsanitizer_shared_hooks.so. The stock
+    gcr.io/oss-fuzz/* image often does not ship that library on the default path.
+    Search the local fuzz-tooling build tree for a copy and return extra docker
+    argv (-v and -e LD_LIBRARY_PATH) to mount it, or [] if not found.
+
+    prefer_path_fragment: e.g. \"dawn-address\" to prefer the sanitizer output tree when
+    multiple copies exist (glob order is otherwise nondeterministic).
+    """
+    build_root = os.path.join(project_dir, "fuzz-tooling", "build")
+    if not os.path.isdir(build_root):
+        return []
+    pattern = os.path.join(build_root, "**", SANITIZER_HOOKS_SO)
+    matches = glob.glob(pattern, recursive=True)
+    if not matches:
+        return []
+    if prefer_path_fragment:
+        preferred = [m for m in matches if prefer_path_fragment in m]
+        if preferred:
+            matches = preferred
+    hooks_dir = os.path.dirname(matches[0])
+    return [
+        "-v",
+        f"{hooks_dir}:{SANITIZER_HOOKS_MOUNT}",
+        "-e",
+        f"LD_LIBRARY_PATH={SANITIZER_HOOKS_MOUNT}:/out",
+    ]
+
 
 def load_task_detail(fuzz_dir: str, logger: Optional['StrategyLogger'] = None) -> Optional[dict]:
     """
@@ -180,6 +214,7 @@ def extract_and_save_crash_input(
             "-v", f"{sanitizer_project_dir}:/src/{project_name}",
             "-v", f"{out_dir_x}:/out",
             "-v", f"{os.path.dirname(crash_file)}:/crashes",
+        ] + docker_args_for_sanitizer_hooks(project_dir, f"{project_name}-{sanitizer}") + [
             docker_image,
             f"/out/{fuzzer_name}",
             "-timeout=30",
@@ -403,6 +438,7 @@ def run_fuzzer_with_coverage(
             "-v", f"{out_dir_x}:/out",
             "-v", f"{work_dir}:/work",
             "-v", f"{seed_corpus_dir}:{corpus_container_path}",
+        ] + docker_args_for_sanitizer_hooks(project_dir, f"{project_name}-{sanitizer}") + [
             docker_image,
             f"/out/{fuzzer_name}",
             "-print_coverage=1",

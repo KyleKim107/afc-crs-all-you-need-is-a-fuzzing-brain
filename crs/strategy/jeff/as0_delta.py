@@ -29,6 +29,9 @@ import uuid
 
 load_dotenv()
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent.parent))
+from crs.strategy.common.utils.task_utils import docker_args_for_sanitizer_hooks
+
 # TAMU AI support
 try:
     from tamu_ai import USE_TAMU_AI, setup_tamu_env, to_tamu_model, get_tamu_fallback, call_tamu_api
@@ -1249,6 +1252,8 @@ def get_same_project_fuzzers(fuzzer_path):
             item_path = os.path.join(fuzzer_dir, item)
             # Check if it's a file and executable
             if os.path.isfile(item_path) and os.access(item_path, os.X_OK):
+                if item.endswith(".json"):
+                    continue
                 # Skip coverage builds and other non-fuzzer executables
                 if not item.endswith('-coverage') and not item in ['llvm-symbolizer', 'clang']:
                     same_project_fuzzers.append(item_path)
@@ -1346,6 +1351,7 @@ def run_fuzzer_with_input(log_file, fuzzer_path, project_dir, focus, blob_path):
                 "-v", f"{sanitizer_project_dir}:/src/{project_name}",
                 "-v", f"{out_dir_x}:/out",
                 "-v", f"{work_dir}:/work",
+            ] + docker_args_for_sanitizer_hooks(project_dir, f"{project_name}-{sanitizer}") + [
                 docker_image,
                 f"/out/{fuzzer_name}",
                 "-timeout=30",           # Add libFuzzer timeout parameter
@@ -1482,6 +1488,7 @@ def extract_and_save_crash_input(log_file, crash_dir, fuzzer_name, out_dir_x, pr
             "-v", f"{sanitizer_project_dir}:/src/{project_name}",
             "-v", f"{out_dir_x}:/out",
             "-v", f"{os.path.dirname(crash_file)}:/crashes",
+        ] + docker_args_for_sanitizer_hooks(project_dir, f"{project_name}-{sanitizer}") + [
             docker_image,
             f"/out/{fuzzer_name}",
             "-timeout=30",
@@ -1664,6 +1671,7 @@ def run_fuzzer_with_coverage(log_file, fuzzer_path, project_dir, focus, sanitize
             "-v", f"{out_dir_x}:/out",
             "-v", f"{work_dir}:/work",
             "-v", f"{seed_corpus_dir}:{corpus_container_path}",
+        ] + docker_args_for_sanitizer_hooks(project_dir, f"{project_name}-{sanitizer}") + [
             docker_image,
             f"/out/{fuzzer_name}",
             "-print_coverage=1",
