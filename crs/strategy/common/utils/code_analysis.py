@@ -17,6 +17,102 @@ if TYPE_CHECKING:
 # Note: tracer is imported from global scope when needed
 
 
+def find_task_directory(task_id: str) -> Optional[str]:
+    """
+    Best-effort lookup for a local task directory.
+
+    Priority:
+    1) TASK_DIR env var (if set and exists)
+    2) parent directories inferred from PROJECT_SRC_DIR / CURRENT_FUZZER
+    3) /crs-workdir scan fallback
+    """
+    task_dir = os.environ.get("TASK_DIR")
+    if task_dir and os.path.isdir(task_dir):
+        return task_dir
+
+    for env_key in ("PROJECT_SRC_DIR", "CURRENT_FUZZER", "FUZZER_PATH"):
+        value = os.environ.get(env_key)
+        if not value:
+            continue
+        candidate = value
+        if os.path.isfile(candidate):
+            candidate = os.path.dirname(candidate)
+        # task root is typically .../workspace/<project>
+        for _ in range(6):
+            if os.path.exists(os.path.join(candidate, "fuzz-tooling")):
+                return candidate
+            parent = os.path.dirname(candidate)
+            if parent == candidate:
+                break
+            candidate = parent
+
+    # Last-resort fallback for local runs.
+    if task_id and os.path.isdir("/crs-workdir"):
+        for name in os.listdir("/crs-workdir"):
+            candidate = os.path.join("/crs-workdir", name)
+            if os.path.isdir(candidate) and task_id in name:
+                return candidate
+
+    return None
+
+
+def run_static_analysis_local(task_id: str, task_dir: str, focus: str) -> bool:
+    """
+    Compatibility shim for legacy strategy imports.
+
+    The new flow relies on analysis-service HTTP endpoints. If local JSON artifacts
+    already exist, report success; otherwise return False so callers can gracefully
+    fall back.
+    """
+    if not task_dir:
+        return False
+    qx_path = os.path.join(task_dir, f"{focus}_qx.json")
+    normal_path = os.path.join(task_dir, f"{focus}.json")
+    return os.path.exists(qx_path) or os.path.exists(normal_path)
+
+
+def load_qx_analysis_results(task_id: str, focus: str, task_dir: str) -> Optional[Dict[str, Any]]:
+    """Load precomputed qx analysis results from disk if present."""
+    if not task_dir:
+        return None
+    qx_path = os.path.join(task_dir, f"{focus}_qx.json")
+    if not os.path.exists(qx_path):
+        return None
+    try:
+        with open(qx_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def get_reachable_functions_qx(fuzzer_src_path: str, results: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Convert qx analysis JSON into the strategy's reachable-function shape.
+    """
+    if not isinstance(results, dict):
+        return []
+
+    fuzzer_key = (fuzzer_src_path or "").replace(os.sep, "/")
+    entry_java = f"{fuzzer_key}.fuzzerTestOneInput"
+    entry_c = f"{fuzzer_key}.LLVMFuzzerTestOneInput"
+
+    reachable_map = results.get("reachable", {}) or {}
+    reachable_names = reachable_map.get(entry_java) or reachable_map.get(entry_c) or []
+    functions_map = results.get("functions", {}) or {}
+
+    reachable_funcs: List[Dict[str, Any]] = []
+    for func_name in reachable_names:
+        func_def = functions_map.get(func_name, {}) or {}
+        reachable_funcs.append({
+            "name": func_def.get("Name", func_name),
+            "file_path": func_def.get("FilePath", ""),
+            "start_line": func_def.get("StartLine", 0),
+            "end_line": func_def.get("EndLine", 0),
+            "body": func_def.get("SourceCode", ""),
+        })
+    return reachable_funcs
+
+
 def extract_reachable_functions_from_analysis_service_for_c(
     fuzzer_path: str,
     fuzzer_src_path: str,
