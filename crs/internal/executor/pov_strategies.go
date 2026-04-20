@@ -814,6 +814,7 @@ func runAdvancedPOVStrategiesWithTimeout(
 				"PATH=/tmp/crs_venv/bin:"+os.Getenv("PATH"),
 				fmt.Sprintf("SUBMISSION_ENDPOINT=%s", submissionEndpoint),
 				fmt.Sprintf("TASK_ID=%s", taskDetail.TaskID.String()),
+				fmt.Sprintf("TASK_DIR=%s", taskDir),
 				fmt.Sprintf("CRS_KEY_ID=%s", os.Getenv("CRS_KEY_ID")),
 				fmt.Sprintf("CRS_KEY_TOKEN=%s", os.Getenv("CRS_KEY_TOKEN")),
 				fmt.Sprintf("COMPETITION_API_KEY_ID=%s", os.Getenv("COMPETITION_API_KEY_ID")),
