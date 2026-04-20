@@ -34,7 +34,9 @@ from crs.strategy.common.utils.code_analysis import (
     load_qx_analysis_results,
     get_reachable_functions_qx,
     find_task_directory,
-    extract_call_paths_from_analysis_service as extract_call_paths_local
+    extract_call_paths_from_analysis_service as extract_call_paths_local,
+    extract_reachable_functions_from_analysis_service as http_extract_reachable_analysis_service,
+    extract_reachable_functions_from_analysis_service_for_c as http_extract_reachable_analysis_service_for_c,
 )
 from crs.strategy.common.utils.task_utils import docker_args_for_sanitizer_hooks
 import concurrent.futures
@@ -926,7 +928,7 @@ def find_fuzzer_source(log_file, fuzzer_path, project_name, project_src_dir, lan
     
     # Collect potential source files
     source_files = {}        
-    extensions = ['.c', '.cc']
+    extensions = ['.c', '.cc', '.cpp', '.cxx']
     if not language.startswith('c'):
         extensions =['.java']
 
@@ -1079,6 +1081,42 @@ def find_fuzzer_source(log_file, fuzzer_path, project_name, project_src_dir, lan
 
     log_message(log_file, f"Collected {len(source_files)} potential source files")
 
+    def _normalize_stem(path_value: str) -> str:
+        stem = os.path.splitext(os.path.basename(path_value))[0].lower()
+        return re.sub(r'[^a-z0-9]', '', stem)
+
+    def _source_path_priority(path_value: str) -> int:
+        p = path_value.replace("\\", "/").lower()
+        score = 0
+        # Prefer canonical source locations over build artifacts.
+        if "/src/dawn/fuzzers/" in p:
+            score += 50
+        if "/src/" in p:
+            score += 20
+        if "/testing/libfuzzer/fuzzers/" in p:
+            score += 15
+        if "/out/" in p or "/obj/" in p:
+            score -= 20
+        return score
+
+    # Strong deterministic match: pick source file whose normalized basename
+    # exactly matches the target fuzzer binary name.
+    normalized_targets = {
+        _normalize_stem(fuzzer_name),
+        _normalize_stem(base_name),
+        _normalize_stem(fuzzer_name.replace("_fuzzer", "")),
+        _normalize_stem(base_name.replace("_fuzzer", "")),
+    }
+    exact_name_matches = []
+    for file_path, content in source_files.items():
+        if _normalize_stem(file_path) in normalized_targets:
+            exact_name_matches.append((file_path, content))
+    if exact_name_matches:
+        exact_name_matches.sort(key=lambda item: _source_path_priority(item[0]), reverse=True)
+        best_path, best_content = exact_name_matches[0]
+        log_message(log_file, f"Selected exact-name fuzzer source: {best_path}")
+        return strip_license_text(best_content), best_path
+
     # If we only found one source file, just return it directly
     if len(source_files) == 1:
         only_file_path = list(source_files.keys())[0]
@@ -1087,6 +1125,7 @@ def find_fuzzer_source(log_file, fuzzer_path, project_name, project_src_dir, lan
     
     # If we have too many source files, filter them to the most likely candidates
     if len(source_files) > 20:
+        original_source_files = dict(source_files)
         filtered_source_files = {}
         
         # Prioritize files with names similar to the fuzzer
@@ -1103,8 +1142,14 @@ def find_fuzzer_source(log_file, fuzzer_path, project_name, project_src_dir, lan
                     if len(filtered_source_files) >= 10:
                         break
         
-        source_files = filtered_source_files
-        log_message(log_file, f"Filtered to {len(source_files)} most likely source files")
+        # If filtering is too strict, keep original candidates so downstream
+        # remapping/normalization can still recover a valid source path.
+        if len(filtered_source_files) == 0:
+            source_files = original_source_files
+            log_message(log_file, f"Filtering produced 0 candidates; keeping original {len(source_files)} source files")
+        else:
+            source_files = filtered_source_files
+            log_message(log_file, f"Filtered to {len(source_files)} most likely source files")
     
     # Prepare the prompt for the model
     prompt = f"""I need to identify the source code file for a fuzzer named '{fuzzer_name}' (base name: '{base_name}').
@@ -1133,10 +1178,12 @@ Based on the build scripts and source files, which file is most likely the sourc
 Please respond with just the full path to the file you believe is the fuzzer source code.
 """
     
-    # Call the model to identify the fuzzer source
+    # Call the model to identify the fuzzer source.
+    # Keep this aligned with runtime-selected model to avoid requiring a
+    # separate Gemini API key when the run is configured for Claude/OpenAI.
     messages = [{"role": "user", "content": prompt}]
-    # Use main model in TAMU mode (gemini-2.5-flash returns garbage on long prompts via TAMU)
-    source_id_model = MODELS[0] if USE_TAMU_AI else GEMINI_MODEL
+    source_id_model = MODELS[0] if MODELS else CLAUDE_MODEL
+    log_message(log_file, f"Using source identification model: {source_id_model}")
     response, success = call_llm(log_file, messages, source_id_model)
     
     if not success:
@@ -1168,15 +1215,76 @@ Please respond with just the full path to the file you believe is the fuzzer sou
         
         # If not, try to read the file directly (also try alternate extensions)
         candidates = [identified_path]
+
+        # Path remapping fallback:
+        # LLM can return workspace-relative absolute paths that miss our active
+        # source root suffix (e.g. /workspace/<proj>/src/... vs
+        # /workspace/<proj>/repo-address/src/...).
+        if project_src_dir and os.path.isdir(project_src_dir):
+            norm_identified = os.path.normpath(identified_path)
+            norm_src_root = os.path.normpath(project_src_dir)
+            root_basename = os.path.basename(norm_src_root.rstrip(os.sep))
+            anchor = f"{os.sep}src{os.sep}"
+            idx = norm_identified.find(anchor)
+            if idx != -1:
+                rel_from_src = norm_identified[idx + 1:]  # "src/..."
+                remapped = os.path.join(norm_src_root, rel_from_src)
+                if remapped not in candidates:
+                    candidates.append(remapped)
+                    log_message(log_file, f"Trying remapped source path: {remapped}")
+
+            # Also try replacing workspace root with current source-root parent
+            if project_dir:
+                norm_proj_root = os.path.normpath(project_dir.rstrip(os.sep))
+                if norm_identified.startswith(norm_proj_root + os.sep):
+                    rel_from_project = os.path.relpath(norm_identified, norm_proj_root)
+                    remapped = os.path.join(os.path.dirname(norm_src_root), rel_from_project)
+                    if remapped not in candidates:
+                        candidates.append(remapped)
+                        log_message(log_file, f"Trying project-root remap: {remapped}")
+
+            # If source root is repo-address/repo, try sibling replacement.
+            for sibling in ("repo-address", "repo"):
+                if root_basename == sibling:
+                    continue
+                sibling_root = os.path.join(os.path.dirname(norm_src_root), sibling)
+                if not os.path.isdir(sibling_root):
+                    continue
+                if root_basename and f"{os.sep}{root_basename}{os.sep}" in norm_identified:
+                    remapped = norm_identified.replace(
+                        f"{os.sep}{root_basename}{os.sep}",
+                        f"{os.sep}{sibling}{os.sep}",
+                        1,
+                    )
+                    if remapped not in candidates:
+                        candidates.append(remapped)
+                        log_message(log_file, f"Trying sibling-root remap: {remapped}")
+
         base_no_ext = os.path.splitext(identified_path)[0]
         for ext in ['.c', '.cc', '.cpp', '.cxx', '.h', '.hpp']:
             alt = base_no_ext + ext
             if alt != identified_path:
                 candidates.append(alt)
+        def _normalize_name_for_match(path_value: str) -> str:
+            base = os.path.basename(path_value)
+            stem, _ = os.path.splitext(base)
+            # Make matching robust across snake_case vs CamelCase and case differences.
+            return re.sub(r'[^a-z0-9]', '', stem.lower())
+
         for candidate in candidates:
             if candidate in source_files:
                 log_message(log_file, f"Found fuzzer source via extension fallback: {candidate}")
                 return strip_license_text(source_files[candidate]), candidate
+
+            # Case-insensitive / style-insensitive filename match against collected sources
+            # (e.g. dawn_wire_server... vs DawnWireServer...).
+            candidate_key = _normalize_name_for_match(candidate)
+            if candidate_key:
+                for source_path, source_content in source_files.items():
+                    if _normalize_name_for_match(source_path) == candidate_key:
+                        log_message(log_file, f"Matched fuzzer source by normalized filename: {source_path}")
+                        return strip_license_text(source_content), source_path
+
             if os.path.exists(candidate):
                 try:
                     with open(candidate, 'r') as f:
@@ -1198,6 +1306,40 @@ Please respond with just the full path to the file you believe is the fuzzer sou
             log_message(log_file, f"Falling back to likely fuzzer source: {file_path}")
             return strip_license_text(source_files[file_path]), file_path
     
+    # Last-resort fallback: try to infer fuzzer source by scanning likely roots.
+    # This prevents sending empty fuzzer_source_path to analysis service.
+    log_message(log_file, "Model couldn't identify fuzzer source; trying filesystem fallback")
+    search_roots = [project_src_dir, os.path.join(project_dir, "repo")]
+    seen_roots = set()
+    extensions = ['.c', '.cc', '.cpp'] if language.startswith('c') else ['.java']
+    entry_symbol = "LLVMFuzzerTestOneInput" if language.startswith('c') else "fuzzerTestOneInput"
+    name_hints = [
+        fuzzer_name.lower(),
+        base_name.lower(),
+        fuzzer_name.lower().replace("_fuzzer", ""),
+        base_name.lower().replace("_fuzzer", ""),
+    ]
+    for root in search_roots:
+        if not root or root in seen_roots or not os.path.isdir(root):
+            continue
+        seen_roots.add(root)
+        for dirpath, _, filenames in os.walk(root):
+            for filename in filenames:
+                if not any(filename.endswith(ext) for ext in extensions):
+                    continue
+                lower_name = filename.lower()
+                if not any(hint and hint in lower_name for hint in name_hints):
+                    continue
+                candidate = os.path.join(dirpath, filename)
+                try:
+                    with open(candidate, "r", encoding="utf-8", errors="backslashreplace") as f:
+                        content = f.read()
+                    if entry_symbol in content:
+                        log_message(log_file, f"Filesystem fallback found fuzzer source: {candidate}")
+                        return strip_license_text(content), candidate
+                except Exception as e:
+                    log_message(log_file, f"Error reading fallback candidate {candidate}: {str(e)}")
+
     log_message(log_file, "Could not identify fuzzer source")
     return "// Could not find the source code for the fuzzer", ""
 
@@ -1209,8 +1351,10 @@ def run_python_code(log_file, code, xbin_dir):
         log_message(log_file, f"Invalid project directory: '{xbin_dir}'")
         return False, "", f"Invalid project directory: '{xbin_dir}'"
     
+    guarded_code = _inject_struct_pack_guard(code)
+
     with tempfile.NamedTemporaryFile(suffix='.py', delete=False) as temp_file:
-        temp_file.write(code.encode('utf-8'))
+        temp_file.write(guarded_code.encode('utf-8'))
         temp_file_path = temp_file.name
     
     try:
@@ -1249,6 +1393,98 @@ def run_python_code(log_file, code, xbin_dir):
     finally:
         # Clean up the temporary file
         os.unlink(temp_file_path)
+
+
+def _inject_struct_pack_guard(code: str) -> str:
+    """
+    Inject a small runtime guard that makes generated struct.pack calls robust.
+
+    LLM-generated PoV scripts frequently try values slightly outside the target
+    integer width (for example, packing 0x10001 with format 'H'), which crashes
+    script execution before any blobs are written. This guard coerces integer
+    arguments into legal ranges only when struct.pack would otherwise fail.
+    """
+    prelude = r'''
+import struct as _orig_struct
+import re as _re
+
+_ORIG_PACK = _orig_struct.pack
+
+def _coerce_int_for_token(v, token):
+    if token == "B":
+        return int(v) & 0xFF
+    if token == "H":
+        return int(v) & 0xFFFF
+    if token in ("I", "L"):
+        return int(v) & 0xFFFFFFFF
+    if token == "Q":
+        return int(v) & 0xFFFFFFFFFFFFFFFF
+    if token == "b":
+        v = int(v)
+        if v < -128:
+            return -128
+        if v > 127:
+            return 127
+        return v
+    if token == "h":
+        v = int(v)
+        if v < -32768:
+            return -32768
+        if v > 32767:
+            return 32767
+        return v
+    if token in ("i", "l"):
+        v = int(v)
+        if v < -2147483648:
+            return -2147483648
+        if v > 2147483647:
+            return 2147483647
+        return v
+    if token == "q":
+        v = int(v)
+        if v < -9223372036854775808:
+            return -9223372036854775808
+        if v > 9223372036854775807:
+            return 9223372036854775807
+        return v
+    return v
+
+def _expand_pack_tokens(fmt):
+    # Remove byte-order / alignment prefix.
+    if fmt and fmt[0] in "@=<>!":
+        fmt = fmt[1:]
+    tokens = []
+    for m in _re.finditer(r'(\d*)([xcbB\?hHiIlLqQnNefdspP])', fmt):
+        count_s, token = m.groups()
+        count = int(count_s) if count_s else 1
+        # 's' and 'p' consume one argument regardless of repeat count.
+        if token in ("s", "p"):
+            tokens.append(token)
+        elif token == "x":
+            # pad byte consumes no argument.
+            continue
+        else:
+            tokens.extend([token] * count)
+    return tokens
+
+def _safe_pack(fmt, *args):
+    try:
+        return _ORIG_PACK(fmt, *args)
+    except Exception:
+        tokens = _expand_pack_tokens(fmt)
+        if not tokens or len(tokens) != len(args):
+            raise
+        coerced = []
+        for token, value in zip(tokens, args):
+            if isinstance(value, int):
+                coerced.append(_coerce_int_for_token(value, token))
+            else:
+                coerced.append(value)
+        return _ORIG_PACK(fmt, *coerced)
+
+_orig_struct.pack = _safe_pack
+'''
+    return prelude + "\n" + (code or "")
 
 def filter_instrumented_lines(text, max_line_length=200):
     if not text:
@@ -3105,17 +3341,31 @@ def extract_reachable_functions_from_analysis_service_for_c(fuzzer_path, fuzzer_
 
 
 def extract_reachable_functions_from_analysis_service(fuzzer_path, fuzzer_src_path, focus, project_src_dir, use_qx=True):
-    """Extract reachable functions using local static analysis"""
+    """Extract reachable functions using local static analysis, with HTTP /v1/reachable fallback."""
+
+    def _http_fallback():
+        print(
+            "Local reachable extraction empty or unavailable; "
+            "falling back to analysis service HTTP /v1/reachable ..."
+        )
+        if use_qx:
+            return http_extract_reachable_analysis_service(
+                fuzzer_path, fuzzer_src_path, focus, project_src_dir, use_both=True
+            ) or []
+        return http_extract_reachable_analysis_service_for_c(
+            fuzzer_path, fuzzer_src_path, focus, project_src_dir
+        ) or []
+
     task_id = os.environ.get("TASK_ID")
     if not task_id:
         print("Warning: TASK_ID environment variable not set")
-        return []
+        return _http_fallback()
 
     # Find the actual task directory
     task_dir = find_task_directory(task_id)
     if not task_dir:
         print(f"Could not find task directory for task_id {task_id}")
-        return []
+        return _http_fallback()
 
     # Run analysis if results don't exist
     if use_qx:
@@ -3132,18 +3382,19 @@ def extract_reachable_functions_from_analysis_service(fuzzer_path, fuzzer_src_pa
         success = run_static_analysis_local(task_id, task_dir, focus)
         if not success:
             print("Failed to run static analysis")
-            return []
+            return _http_fallback()
 
         # Wait for results
         import time
         time.sleep(2)
+
+    reachable_funcs = []
 
     # Load results
     if use_qx:
         results = load_qx_analysis_results(task_id, focus, task_dir)
         if results:
             reachable_funcs = get_reachable_functions_qx(fuzzer_src_path, results)
-            return reachable_funcs
     else:
         # For non-QX, load regular results
         if os.path.exists(results_file):
@@ -3156,6 +3407,7 @@ def extract_reachable_functions_from_analysis_service(fuzzer_path, fuzzer_src_pa
             entry_point = f"{fuzzer_key}.fuzzerTestOneInput" if fuzzer_src_path.endswith('.java') else f"{fuzzer_key}.LLVMFuzzerTestOneInput"
 
             reachable_names = results.get('reachable', {}).get(entry_point, [])
+
             functions_map = results.get('functions', {})
 
             reachable_funcs = []
@@ -3168,9 +3420,10 @@ def extract_reachable_functions_from_analysis_service(fuzzer_path, fuzzer_src_pa
                     'end_line': func_def.get('EndLine', 0),
                     'body': func_def.get('SourceCode', '')  # Use 'body' for consistency
                 })
-            return reachable_funcs
 
-    return []
+    if reachable_funcs:
+        return reachable_funcs
+    return _http_fallback()
 
 
 
@@ -3632,9 +3885,27 @@ def covert_target_functions_format(reachable_funcs):
     simplified_modified_functions = {}
 
     for func in reachable_funcs:
-        file_path = func.get("FilePath") or func.get("file_path")
-        name = func.get("Name") or func.get("name")
-        start_line = func.get("StartLine") or func.get("start_line")
+        # static-analysis service returns Go struct fields as JSON keys:
+        # Name, FilePath, StartLine, EndLine, SourceCode (capitalized)
+        file_path = (
+            func.get("FilePath")
+            or func.get("file_path")
+            or func.get("file")
+        )
+        name = func.get("Name") or func.get("name") or func.get("function")
+        start_line = (
+            func.get("StartLine")
+            if func.get("StartLine") is not None
+            else func.get("start_line")
+        )
+        if start_line is None:
+            # Some callers stringify line numbers; tolerate int-like strings.
+            line_str = func.get("line")
+            if line_str is not None:
+                try:
+                    start_line = int(line_str)
+                except (TypeError, ValueError):
+                    start_line = None
 
         if not file_path or not name or start_line is None:
             continue  # Skip incomplete entries
