@@ -3,6 +3,7 @@ Code Analysis Utilities
 
 Functions for querying static analysis services and processing analysis results.
 """
+import errno
 import os
 import re
 import json
@@ -10,11 +11,58 @@ import time
 import textwrap
 import requests
 from typing import Dict, List, Any, Optional, Tuple, TYPE_CHECKING
+from urllib.parse import urlparse
 
 if TYPE_CHECKING:
     from opentelemetry import trace
 
 # Note: tracer is imported from global scope when needed
+
+
+def _is_analysis_service_connection_refused(exc: BaseException) -> bool:
+    """
+    True when nothing is listening on the analysis TCP port.
+
+    Retrying 60× with long backoff is pointless for ECONNREFUSED; fail fast so
+    local runs without crs-analysis don't stall parallel POV phases.
+    """
+    e: Optional[BaseException] = exc
+    seen: set[int] = set()
+    while e is not None and id(e) not in seen:
+        seen.add(id(e))
+        eno = getattr(e, "errno", None)
+        if eno == errno.ECONNREFUSED:
+            return True
+        msg = str(e).lower()
+        if "connection refused" in msg or "errno 111" in msg:
+            return True
+        e = e.__cause__ or e.__context__
+    return False
+
+
+def _normalize_analysis_service_url(url: str) -> str:
+    """
+    Normalize analysis endpoint base URL across local and containerized runs.
+
+    In local mode, some workers can inherit the in-cluster hostname
+    `crs-analysis`, which is not resolvable from the host network namespace.
+    Rewrite it to localhost so all parallel phases use the same reachable
+    endpoint.
+    """
+    normalized = (url or "").strip().rstrip("/")
+    if not normalized:
+        normalized = "http://localhost:7082"
+
+    parsed = urlparse(normalized)
+    if parsed.hostname == "crs-analysis" and os.environ.get("LOCAL_TEST") == "1":
+        # Keep local runs robust even when an in-cluster URL leaks in.
+        fallback = "http://localhost:7082"
+        if parsed.path and parsed.path != "/":
+            fallback = f"{fallback}{parsed.path.rstrip('/')}"
+        print(f"Rewriting ANALYSIS_SERVICE_URL for local run: {normalized} -> {fallback}")
+        return fallback
+
+    return normalized
 
 
 def find_task_directory(task_id: str) -> Optional[str]:
@@ -24,7 +72,9 @@ def find_task_directory(task_id: str) -> Optional[str]:
     Priority:
     1) TASK_DIR env var (if set and exists)
     2) parent directories inferred from PROJECT_SRC_DIR / CURRENT_FUZZER
-    3) /crs-workdir scan fallback
+    3) walk upward from current working directory (advanced POV subprocesses use
+       cwd = workspace root but often omit TASK_DIR)
+    4) /crs-workdir scan fallback
     """
     task_dir = os.environ.get("TASK_DIR")
     if task_dir and os.path.isdir(task_dir):
@@ -40,6 +90,22 @@ def find_task_directory(task_id: str) -> Optional[str]:
         # task root is typically .../workspace/<project>
         for _ in range(6):
             if os.path.exists(os.path.join(candidate, "fuzz-tooling")):
+                return candidate
+            parent = os.path.dirname(candidate)
+            if parent == candidate:
+                break
+            candidate = parent
+
+    # Advanced as0_full.py phases are started with cwd = task workspace (e.g. .../dawn)
+    # but TASK_DIR is not always set; find the tree root that contains fuzz-tooling.
+    try:
+        cwd = os.path.realpath(os.getcwd())
+    except OSError:
+        cwd = ""
+    if cwd:
+        candidate = cwd
+        for _ in range(12):
+            if os.path.isdir(os.path.join(candidate, "fuzz-tooling")):
                 return candidate
             parent = os.path.dirname(candidate)
             if parent == candidate:
@@ -131,7 +197,9 @@ def extract_reachable_functions_from_analysis_service_for_c(
     Returns:
         List of reachable function dicts with Name, Body, FilePath, etc.
     """
-    ANALYSIS_SERVICE_URL = os.environ.get("ANALYSIS_SERVICE_URL", "http://localhost:7082")
+    ANALYSIS_SERVICE_URL = _normalize_analysis_service_url(
+        os.environ.get("ANALYSIS_SERVICE_URL", "http://localhost:7082")
+    )
     if "/v1/reachable" not in ANALYSIS_SERVICE_URL:
         ANALYSIS_SERVICE_URL = f"{ANALYSIS_SERVICE_URL}/v1/reachable"
 
@@ -165,6 +233,12 @@ def extract_reachable_functions_from_analysis_service_for_c(
 
         except Exception as e:
             print(f"Error querying analysis service on attempt {attempt}: {e}")
+            if _is_analysis_service_connection_refused(e):
+                print(
+                    f"Analysis service not accepting connections at {ANALYSIS_SERVICE_URL}; "
+                    "aborting reachable fetch (start crs-analysis or set ANALYSIS_SERVICE_URL)."
+                )
+                break
 
         if attempt < max_tries:
             time.sleep(backoff_sec)
@@ -193,7 +267,9 @@ def extract_reachable_functions_from_analysis_service(
     Returns:
         List of reachable function dicts
     """
-    ANALYSIS_SERVICE_URL = os.environ.get("ANALYSIS_SERVICE_URL", "http://localhost:7082")
+    ANALYSIS_SERVICE_URL = _normalize_analysis_service_url(
+        os.environ.get("ANALYSIS_SERVICE_URL", "http://localhost:7082")
+    )
     if "/v1/reachable" not in ANALYSIS_SERVICE_URL:
         ANALYSIS_SERVICE_URL = f"{ANALYSIS_SERVICE_URL}/v1/reachable"
     ANALYSIS_SERVICE_URL_QX = f"{ANALYSIS_SERVICE_URL}_qx"
@@ -235,6 +311,12 @@ def extract_reachable_functions_from_analysis_service(
 
         except Exception as e:
             print(f"Error querying analysis service on attempt {attempt}: {e}")
+            if _is_analysis_service_connection_refused(e):
+                print(
+                    f"Analysis service not accepting connections at {ANALYSIS_SERVICE_URL} "
+                    f"(or {ANALYSIS_SERVICE_URL_QX}); aborting reachable fetch."
+                )
+                break
 
         if attempt < max_tries:
             time.sleep(backoff_sec)
@@ -474,7 +556,9 @@ def extract_call_paths_from_analysis_service(
         TASK_ID: Task identifier for tracking analysis requests
     """
     # Get analysis service endpoint
-    ANALYSIS_SERVICE_URL = os.environ.get("ANALYSIS_SERVICE_URL", "http://localhost:7082")
+    ANALYSIS_SERVICE_URL = _normalize_analysis_service_url(
+        os.environ.get("ANALYSIS_SERVICE_URL", "http://localhost:7082")
+    )
 
     # Select endpoint based on use_qx flag
     if use_qx:
@@ -495,6 +579,13 @@ def extract_call_paths_from_analysis_service(
             })
         if function_info:  # Only include if there are functions
             simplified_modified_functions[file_path] = function_info
+
+    if not simplified_modified_functions:
+        print(
+            "Skipping analysis service call: target_functions is empty after normalization. "
+            "The /v1/analysis endpoint requires at least one target function."
+        )
+        return []
 
     # Build request payload
     payload = {
