@@ -304,6 +304,9 @@ func RobustCopyDir(src, dst string) error {
 	for _, entry := range entries {
 		srcPath := filepath.Join(src, entry.Name())
 		dstPath := filepath.Join(dst, entry.Name())
+		if shouldSkipCopyPath(srcPath) {
+			continue
+		}
 
 		// Use Lstat instead of Stat to detect symlinks
 		entryInfo, err := os.Lstat(srcPath)
@@ -356,6 +359,31 @@ func RobustCopyDir(src, dst string) error {
 	}
 
 	return nil
+}
+
+// shouldSkipCopyPath filters ephemeral or permission-sensitive paths that are
+// not needed for local strategy runs and commonly cause noisy copy warnings.
+func shouldSkipCopyPath(srcPath string) bool {
+	cleaned := filepath.Clean(srcPath)
+	cleaned = filepath.ToSlash(cleaned)
+
+	// OSS-Fuzz/CIPD lock files are transient and often root-owned.
+	if strings.HasSuffix(cleaned, "/.lock") && strings.Contains(cleaned, "/.cipd/pkgs/") {
+		return true
+	}
+
+	// _bad_scm trees are generated scratch content and frequently unreadable.
+	if strings.Contains(cleaned, "/_bad_scm/") || strings.HasSuffix(cleaned, "/_bad_scm") {
+		return true
+	}
+
+	// Debian sysroots under build/linux (e.g. debian_bullseye_amd64-sysroot/debian) are
+	// often root-only after OSS-Fuzz/Chromium builds; not needed for strategy workspace copies.
+	if strings.Contains(cleaned, "-sysroot/") || strings.HasSuffix(cleaned, "-sysroot") {
+		return true
+	}
+
+	return false
 }
 
 // ─── Process Group Management ───────────────────────────────────────────────

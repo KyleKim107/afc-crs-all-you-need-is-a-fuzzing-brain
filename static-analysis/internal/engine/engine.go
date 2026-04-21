@@ -2722,15 +2722,20 @@ var (
 )
 
 func getWorkDir() string {
+	// CRS services use CRS_WORKDIR (no underscore); keep CRS_WORK_DIR for backward compatibility.
 	if v := os.Getenv("CRS_WORK_DIR"); v != "" {
+		return v
+	}
+	if v := os.Getenv("CRS_WORKDIR"); v != "" {
 		return v
 	}
 	return WORK_DIR
 }
 
 func TryLoadJsonResults(taskID string, focus string) (*models.AnalysisResults, error) {
-	// taskDir := path.Join(getWorkDir(), taskID)
-	outputJson := path.Join(getWorkDir(), fmt.Sprintf("%s.json", focus))
+	// Must match EngineMainAnalysisCore: output is getWorkDir()/taskID/<focus>.json (same as TryLoadQXJsonResults layout).
+	taskDir := path.Join(getWorkDir(), taskID)
+	outputJson := path.Join(taskDir, fmt.Sprintf("%s.json", focus))
 	if !fileExists(outputJson) {
 		log.Printf("Error")
 		log.Printf("The file %v does not exist", outputJson)
@@ -3063,7 +3068,7 @@ func robustCopyDir(src, dst string) error {
 func EngineMainAnalysis(taskDetail models.TaskDetail) (models.AnalysisResults, error) {
 
 	taskID := taskDetail.TaskID.String()
-	taskDir := path.Join(WORK_DIR, taskID)
+	taskDir := path.Join(getWorkDir(), taskID)
 	return EngineMainAnalysisCore(taskDetail, taskDir)
 }
 

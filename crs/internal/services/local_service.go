@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
+	"net/http"
 	"os"
 	"os/exec"
 	"path"
@@ -315,6 +317,12 @@ func (s *LocalCRSService) SubmitLocalTask(taskDir string) error {
 		Tasks:       []models.TaskDetail{taskDetail},
 	}
 
+	// Reachability requests depend on baseline analysis results.
+	// Submit task to analysis service first so repo.json can be produced.
+	if err := s.submitTaskToAnalysisService(fullTask); err != nil {
+		return fmt.Errorf("failed to submit task to analysis service: %w", err)
+	}
+
 	// Use executor package for fuzzing execution
 	execParams := executor.TaskExecutionParams{
 		Fuzzer:                   myFuzzer,
@@ -340,6 +348,35 @@ func (s *LocalCRSService) SubmitLocalTask(taskDir string) error {
 		log.Printf("Processing task %s: %v fuzzer: %s", taskDetail.TaskID, err, myFuzzer)
 	}
 
+	return nil
+}
+
+func (s *LocalCRSService) submitTaskToAnalysisService(task models.Task) error {
+	endpoint := strings.TrimRight(s.analysisServiceUrl, "/") + "/v1/task"
+	payload, err := json.Marshal(task)
+	if err != nil {
+		return fmt.Errorf("marshal analysis task payload: %w", err)
+	}
+
+	req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewBuffer(payload))
+	if err != nil {
+		return fmt.Errorf("create request for %s: %w", endpoint, err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("post to %s: %w", endpoint, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		return fmt.Errorf("analysis service returned %d: %s", resp.StatusCode, string(body))
+	}
+
+	log.Printf("Submitted task to analysis service: %s", endpoint)
 	return nil
 }
 
