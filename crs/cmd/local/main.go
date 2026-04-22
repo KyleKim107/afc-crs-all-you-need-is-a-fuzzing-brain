@@ -24,6 +24,12 @@ func main() {
 	}
 	taskPath := flag.Arg(0)
 
+	// config.Load maps LOCAL_TEST to localhost analysis (7082) / submission (7081) URLs.
+	// LocalCRSService also enables LOCAL_TEST later; setting it here keeps URLs consistent.
+	if os.Getenv("LOCAL_TEST") == "" {
+		_ = os.Setenv("LOCAL_TEST", "1")
+	}
+
 	// Get absolute paths
 	absTaskDir, err := filepath.Abs(taskPath)
 	if err != nil {
