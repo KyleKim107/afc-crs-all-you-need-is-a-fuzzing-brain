@@ -740,15 +740,19 @@ Start by reading the vulnerable function source with get_function_source("{funct
                         try:
                             result = json.loads(tool_result)
                             if result.get("success") and not result.get("crashed"):
-                                # POV didn't crash - inject analysis prompt
-                                output_hint = result.get("output_hint", "")
+                                # POV didn't crash - inject analysis prompt.
+                                # verify_pov returns the fuzzer-output summary
+                                # under "output_summary"; nothing produces
+                                # "output_hint", so this used to render
+                                # "(no output)" on every non-crashing attempt.
+                                output_summary = result.get("output_summary", "")
                                 self.messages.append(
                                     {
                                         "role": "user",
                                         "content": f"""This POV did not trigger a crash. Before trying again, ANALYZE:
 
-1. Did the input reach the vulnerable function? Check the output hint:
-{output_hint[:300] if output_hint else "(no output)"}
+1. Did the input reach the vulnerable function? Check the fuzzer output:
+{output_summary[:300] if output_summary else "(no output)"}
 
 2. What conditions are needed to trigger the vulnerability?
 3. What's different between your input and what the vulnerability needs?
