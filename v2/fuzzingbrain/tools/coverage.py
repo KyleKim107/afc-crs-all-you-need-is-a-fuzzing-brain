@@ -181,6 +181,53 @@ def parse_lcov(
     return dict(executed_branches), dict(executed_lines), executed_functions
 
 
+def _mangled_identifiers(symbol: str) -> List[str]:
+    """Pull the source-level identifiers out of an Itanium-mangled symbol.
+
+    The ABI encodes every identifier as ``<length><name>``, so the components
+    can be read off without a demangler:
+    ``_ZNK2mu10ParserBase16ParseCmdCodeBulkEii`` yields
+    ``["mu", "ParserBase", "ParseCmdCodeBulk"]``. Substrings that merely look
+    like a name are never returned, because the length prefix has to agree.
+    """
+    names: List[str] = []
+    i, n = 0, len(symbol)
+    while i < n:
+        if not symbol[i].isdigit():
+            i += 1
+            continue
+        j = i
+        while j < n and symbol[j].isdigit():
+            j += 1
+        length = int(symbol[i:j])
+        if length and j + length <= n:
+            names.append(symbol[j : j + length])
+            i = j + length
+        else:
+            i = j
+    return names
+
+
+def function_was_executed(target: str, executed_functions: List[str]) -> bool:
+    """Whether ``target`` is among the functions LCOV recorded as executed.
+
+    LCOV reports whatever symbol names the binary carries. For C that is the
+    plain function name, but a C++ target is reported mangled --
+    ``ParseCmdCodeBulk`` appears as ``_ZNK2mu10ParserBase16ParseCmdCodeBulkEii``
+    -- while callers hand us the plain name they read out of the source or a
+    sanitizer stack trace. A plain equality test therefore answers "not
+    executed" for every C++ target, and reports no error while doing it, so the
+    caller cannot tell the question was never really asked.
+    """
+    if target in executed_functions:
+        return True
+
+    return any(
+        sym.startswith("_Z") and target in _mangled_identifiers(sym)
+        for sym in executed_functions
+    )
+
+
 # =============================================================================
 # Coverage Execution
 # =============================================================================
@@ -953,7 +1000,7 @@ def _run_coverage_in_dir(
     target_reached = {}
     if target_functions:
         for func in target_functions:
-            target_reached[func] = func in executed_functions
+            target_reached[func] = function_was_executed(func, executed_functions)
 
     # Get code context
     coverage_summary = ""
@@ -1287,6 +1334,7 @@ __all__ = [
     "get_coverage_context",
     "CoverageResult",
     "parse_lcov",
+    "function_was_executed",
     "run_coverage_fuzzer",
     "get_executed_code_context",
     # GDB trace
